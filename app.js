@@ -5,9 +5,7 @@ const ctx = canvas.getContext("2d");
 canvas.width = window.innerWidth;
 canvas.height = window.innerHeight;
 
-// ----------------------
-// MediaPipe Pose
-// ----------------------
+// ---------- MediaPipe Pose ----------
 const pose = new Pose({
   locateFile: (file) =>
     `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`,
@@ -31,12 +29,10 @@ const camera = new Camera(video, {
 });
 camera.start();
 
-// ----------------------
-// 簡化版 Boxing Analyst
-// ----------------------
+// ---------- 核心邏輯（簡化穩定版） ----------
 class SimpleBoxing {
   constructor() {
-    this.state = "WAIT";   // WAIT → SIGNAL → MOVING → RESULT
+    this.state = "WAIT"; // WAIT → SIGNAL → MOVING → RESULT
 
     this.signalTime = 0;
     this.moveStartTime = 0;
@@ -44,19 +40,24 @@ class SimpleBoxing {
     this.reactionTime = 0;
     this.peakSpeed = 0;
 
-    this.prevPosR = null;
-    this.prevPosL = null;
+    this.prevR = null;
+    this.prevL = null;
 
-    this.smoothVelR = 0;
-    this.smoothVelL = 0;
+    this.smoothR = 0;
+    this.smoothL = 0;
 
-    this.ALPHA = 0.6;
-    this.VELOCITY_THRESHOLD = 0.8; // 啟動拳速閾值 (m/s 模擬)
+    this.ALPHA = 0.5;
+
+    // ===== 抗雜訊關鍵參數 =====
+    this.MIN_MOVE_DIST = 0.015;  // 最小位移門檻（越大越不敏感）
+    this.START_VEL = 0.10;       // 啟動速度門檻
+    this.CONSEC_FRAMES = 4;     // 連續幀確認
+
+    this.moveCounter = 0;
 
     this.lastTime = performance.now();
-
     this.waitStart = performance.now();
-    this.randomDelay = this.randDelay();
+    this.delay = this.randDelay();
   }
 
   randDelay() {
@@ -67,14 +68,20 @@ class SimpleBoxing {
     const dx = a.x - b.x;
     const dy = a.y - b.y;
     const dz = a.z - b.z;
-    return Math.sqrt(dx*dx + dy*dy + dz*dz);
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
   }
 
-  getVelocity(curr, prev, prevSmooth, dt) {
+  velocity(curr, prev, prevSmooth, dt) {
     if (!prev || dt <= 0) return { v: 0, pos: curr };
 
     const d = this.dist(curr, prev);
-    const raw = d / dt;         // 這裡是「比例速度」
+
+    // ── 防線 1：位移太小直接忽略 ──
+    if (d < this.MIN_MOVE_DIST) {
+      return { v: 0, pos: curr };
+    }
+
+    const raw = d / dt;
     const smooth = this.ALPHA * raw + (1 - this.ALPHA) * prevSmooth;
 
     return { v: smooth, pos: curr };
@@ -88,45 +95,50 @@ class SimpleBoxing {
     const rw = lm[15]; // 右手腕
     const lw = lm[16]; // 左手腕
 
-    // 平滑速度
-    let r = this.getVelocity(rw, this.prevPosR, this.smoothVelR, dt);
-    let l = this.getVelocity(lw, this.prevPosL, this.smoothVelL, dt);
+    const r = this.velocity(rw, this.prevR, this.smoothR, dt);
+    const l = this.velocity(lw, this.prevL, this.smoothL, dt);
 
-    this.smoothVelR = r.v;
-    this.smoothVelL = l.v;
-    this.prevPosR = r.pos;
-    this.prevPosL = l.pos;
+    this.smoothR = r.v;
+    this.smoothL = l.v;
+    this.prevR = r.pos;
+    this.prevL = l.pos;
 
-    const maxVel = Math.max(this.smoothVelR, this.smoothVelL);
-    this.peakSpeed = Math.max(this.peakSpeed, maxVel);
+    const maxV = Math.max(this.smoothR, this.smoothL);
 
-    // ---------------- 狀態機 ----------------
+    // ---------- 狀態機 ----------
     if (this.state === "WAIT") {
-      if (now - this.waitStart > this.randomDelay) {
+      if (now - this.waitStart > this.delay) {
         this.state = "SIGNAL";
         this.signalTime = now;
+        this.moveCounter = 0;
       }
     }
 
     else if (this.state === "SIGNAL") {
-      // 偵測開始出拳
-      if (maxVel > this.VELOCITY_THRESHOLD) {
+      // ── 防線 2+3：連續幀 + 速度門檻 ──
+      if (maxV > this.START_VEL) {
+        this.moveCounter++;
+      } else {
+        this.moveCounter = 0;
+      }
+
+      if (this.moveCounter >= this.CONSEC_FRAMES) {
         this.moveStartTime = now;
-        this.reactionTime = (this.moveStartTime - this.signalTime) / 1000;
+        this.reactionTime =
+          (this.moveStartTime - this.signalTime) / 1000;
         this.state = "MOVING";
       }
     }
 
     else if (this.state === "MOVING") {
-      // 1 秒後進結果
-      if ((now - this.moveStartTime) > 1000) {
+      this.peakSpeed = Math.max(this.peakSpeed, maxV);
+      if (now - this.moveStartTime > 1000) {
         this.state = "RESULT";
       }
     }
 
     else if (this.state === "RESULT") {
-      // 停 2 秒自動重來
-      if ((now - this.moveStartTime) > 3000) {
+      if (now - this.moveStartTime > 3000) {
         this.reset();
       }
     }
@@ -135,51 +147,57 @@ class SimpleBoxing {
   reset() {
     this.state = "WAIT";
     this.waitStart = performance.now();
-    this.randomDelay = this.randDelay();
+    this.delay = this.randDelay();
 
     this.peakSpeed = 0;
-    this.prevPosR = null;
-    this.prevPosL = null;
-    this.smoothVelR = 0;
-    this.smoothVelL = 0;
+    this.prevR = null;
+    this.prevL = null;
+    this.smoothR = 0;
+    this.smoothL = 0;
+    this.moveCounter = 0;
   }
 }
 
 const analyst = new SimpleBoxing();
 
-// ----------------------
-// 繪圖 & UI
-// ----------------------
+// ---------- UI ----------
 function drawUI() {
   ctx.fillStyle = "white";
   ctx.font = "32px sans-serif";
 
   if (analyst.state === "WAIT") {
-    ctx.fillText("準備…", 40, 60);
+    ctx.fillText("準備中…", 40, 60);
   }
 
   if (analyst.state === "SIGNAL") {
     ctx.fillStyle = "yellow";
     ctx.font = "48px sans-serif";
-    ctx.fillText("出拳！", canvas.width/2 - 70, canvas.height/2);
+    ctx.fillText("出拳！", canvas.width / 2 - 70, canvas.height / 2);
   }
 
   if (analyst.state === "MOVING") {
     ctx.fillStyle = "lime";
-    ctx.fillText("偵測中…", 40, 60);
+    ctx.font = "28px sans-serif";
+    ctx.fillText("偵測出拳中…", 40, 60);
   }
 
   if (analyst.state === "RESULT") {
     ctx.fillStyle = "cyan";
     ctx.font = "32px sans-serif";
-    ctx.fillText(`反應時間: ${analyst.reactionTime.toFixed(3)} s`, 40, 80);
-    ctx.fillText(`最大拳速: ${analyst.peakSpeed.toFixed(2)} (比例)`, 40, 130);
+    ctx.fillText(
+      `反應時間: ${analyst.reactionTime.toFixed(3)} s`,
+      40,
+      80
+    );
+    ctx.fillText(
+      `最大拳速: ${analyst.peakSpeed.toFixed(3)}`,
+      40,
+      130
+    );
   }
 }
 
-// ----------------------
-// 主回呼
-// ----------------------
+// ---------- 主回呼 ----------
 function onResults(results) {
   ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
 
