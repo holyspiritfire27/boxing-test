@@ -5,7 +5,7 @@ const ctx = canvas.getContext("2d");
 canvas.width = window.innerWidth;
 canvas.height = window.innerHeight;
 
-// ---------- MediaPipe Pose ----------
+// ---------- MediaPipe ----------
 const pose = new Pose({
   locateFile: (file) =>
     `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`,
@@ -29,10 +29,13 @@ const camera = new Camera(video, {
 });
 camera.start();
 
-// ---------- 核心邏輯（簡化穩定版） ----------
+// ===================================================
+// 極穩定版 SimpleBoxing
+// ===================================================
 class SimpleBoxing {
   constructor() {
-    this.state = "WAIT"; // WAIT → SIGNAL → MOVING → RESULT
+    this.state = "INIT"; 
+    // INIT → CALM → WAIT → SIGNAL → MOVING → RESULT
 
     this.signalTime = 0;
     this.moveStartTime = 0;
@@ -48,10 +51,13 @@ class SimpleBoxing {
 
     this.ALPHA = 0.5;
 
-    // ===== 抗雜訊關鍵參數 =====
-    this.MIN_MOVE_DIST = 0.015;  // 最小位移門檻（越大越不敏感）
-    this.START_VEL = 0.10;       // 啟動速度門檻
-    this.CONSEC_FRAMES = 4;     // 連續幀確認
+    // ----------- 動態門檻 -----------
+    this.noiseSamples = [];
+    this.NOISE_FRAMES = 30;   // 約 1 秒
+    this.noiseLevel = 0;
+
+    this.START_FACTOR = 6;   // 必須 > 雜訊 * 6
+    this.CONSEC_FRAMES = 5;
 
     this.moveCounter = 0;
 
@@ -61,39 +67,34 @@ class SimpleBoxing {
   }
 
   randDelay() {
-    return 2000 + Math.random() * 2000; // 2~4 秒
+    return 2000 + Math.random() * 2000;
   }
 
   dist(a, b) {
     const dx = a.x - b.x;
     const dy = a.y - b.y;
     const dz = a.z - b.z;
-    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    return Math.sqrt(dx*dx + dy*dy + dz*dz);
   }
 
   velocity(curr, prev, prevSmooth, dt) {
     if (!prev || dt <= 0) return { v: 0, pos: curr };
 
     const d = this.dist(curr, prev);
-
-    // ── 防線 1：位移太小直接忽略 ──
-    if (d < this.MIN_MOVE_DIST) {
-      return { v: 0, pos: curr };
-    }
-
     const raw = d / dt;
     const smooth = this.ALPHA * raw + (1 - this.ALPHA) * prevSmooth;
 
     return { v: smooth, pos: curr };
   }
 
+  // ----------- 核心更新 -----------
   update(lm) {
     const now = performance.now();
     const dt = (now - this.lastTime) / 1000;
     this.lastTime = now;
 
-    const rw = lm[15]; // 右手腕
-    const lw = lm[16]; // 左手腕
+    const rw = lm[15];
+    const lw = lm[16];
 
     const r = this.velocity(rw, this.prevR, this.smoothR, dt);
     const l = this.velocity(lw, this.prevL, this.smoothL, dt);
@@ -105,18 +106,49 @@ class SimpleBoxing {
 
     const maxV = Math.max(this.smoothR, this.smoothL);
 
-    // ---------- 狀態機 ----------
+    // ===================================================
+    // 狀態機
+    // ===================================================
+
+    // ---------- 0. INIT ----------
+    if (this.state === "INIT") {
+      this.state = "CALM";
+      this.noiseSamples = [];
+      return;
+    }
+
+    // ---------- 1. CALM（靜止雜訊校準） ----------
+    if (this.state === "CALM") {
+      this.noiseSamples.push(maxV);
+
+      if (this.noiseSamples.length >= this.NOISE_FRAMES) {
+        const avg =
+          this.noiseSamples.reduce((a, b) => a + b, 0) /
+          this.noiseSamples.length;
+
+        this.noiseLevel = avg;
+        this.state = "WAIT";
+        this.waitStart = now;
+        this.delay = this.randDelay();
+      }
+      return;
+    }
+
+    // ---------- 2. WAIT ----------
     if (this.state === "WAIT") {
       if (now - this.waitStart > this.delay) {
         this.state = "SIGNAL";
         this.signalTime = now;
         this.moveCounter = 0;
       }
+      return;
     }
 
-    else if (this.state === "SIGNAL") {
-      // ── 防線 2+3：連續幀 + 速度門檻 ──
-      if (maxV > this.START_VEL) {
+    // ---------- 3. SIGNAL ----------
+    if (this.state === "SIGNAL") {
+      const startThreshold = this.noiseLevel * this.START_FACTOR;
+
+      if (maxV > startThreshold) {
         this.moveCounter++;
       } else {
         this.moveCounter = 0;
@@ -126,44 +158,55 @@ class SimpleBoxing {
         this.moveStartTime = now;
         this.reactionTime =
           (this.moveStartTime - this.signalTime) / 1000;
+        this.peakSpeed = 0;
         this.state = "MOVING";
       }
+      return;
     }
 
-    else if (this.state === "MOVING") {
+    // ---------- 4. MOVING ----------
+    if (this.state === "MOVING") {
       this.peakSpeed = Math.max(this.peakSpeed, maxV);
+
       if (now - this.moveStartTime > 1000) {
         this.state = "RESULT";
       }
+      return;
     }
 
-    else if (this.state === "RESULT") {
+    // ---------- 5. RESULT ----------
+    if (this.state === "RESULT") {
       if (now - this.moveStartTime > 3000) {
         this.reset();
       }
+      return;
     }
   }
 
   reset() {
-    this.state = "WAIT";
-    this.waitStart = performance.now();
-    this.delay = this.randDelay();
+    this.state = "CALM";
+    this.noiseSamples = [];
+    this.moveCounter = 0;
 
-    this.peakSpeed = 0;
     this.prevR = null;
     this.prevL = null;
     this.smoothR = 0;
     this.smoothL = 0;
-    this.moveCounter = 0;
   }
 }
 
 const analyst = new SimpleBoxing();
 
-// ---------- UI ----------
+// ===================================================
+// UI
+// ===================================================
 function drawUI() {
   ctx.fillStyle = "white";
   ctx.font = "32px sans-serif";
+
+  if (analyst.state === "CALM") {
+    ctx.fillText("請保持靜止…", 40, 60);
+  }
 
   if (analyst.state === "WAIT") {
     ctx.fillText("準備中…", 40, 60);
@@ -172,7 +215,7 @@ function drawUI() {
   if (analyst.state === "SIGNAL") {
     ctx.fillStyle = "yellow";
     ctx.font = "48px sans-serif";
-    ctx.fillText("出拳！", canvas.width / 2 - 70, canvas.height / 2);
+    ctx.fillText("出拳！", canvas.width/2 - 70, canvas.height/2);
   }
 
   if (analyst.state === "MOVING") {
@@ -197,10 +240,11 @@ function drawUI() {
   }
 }
 
-// ---------- 主回呼 ----------
+// ===================================================
+// 主回呼
+// ===================================================
 function onResults(results) {
   ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
-
   if (!results.poseLandmarks) return;
 
   analyst.update(results.poseLandmarks);
