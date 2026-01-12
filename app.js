@@ -30,7 +30,7 @@ const camera = new Camera(video, {
 camera.start();
 
 // ===================================================
-// 極穩定版 SimpleBoxing
+// 平衡穩定版 SimpleBoxing
 // ===================================================
 class SimpleBoxing {
   constructor() {
@@ -56,8 +56,10 @@ class SimpleBoxing {
     this.NOISE_FRAMES = 30;   // 約 1 秒
     this.noiseLevel = 0;
 
-    this.START_FACTOR = 6;   // 必須 > 雜訊 * 6
-    this.CONSEC_FRAMES = 5;
+    this.START_FACTOR = 3;   // ✔ 原 6 → 3
+    this.CONSEC_FRAMES = 2;  // ✔ 原 5 → 2
+
+    this.MIN_START_VEL = 0.03; // 最低安全門檻
 
     this.moveCounter = 0;
 
@@ -146,7 +148,9 @@ class SimpleBoxing {
 
     // ---------- 3. SIGNAL ----------
     if (this.state === "SIGNAL") {
-      const startThreshold = this.noiseLevel * this.START_FACTOR;
+      // 👉 動態門檻 + 最低安全門檻
+      const dynThreshold = this.noiseLevel * this.START_FACTOR;
+      const startThreshold = Math.max(dynThreshold, this.MIN_START_VEL);
 
       if (maxV > startThreshold) {
         this.moveCounter++;
